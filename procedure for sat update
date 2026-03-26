@@ -1,1 +1,398 @@
-daw
+-- ============================================================
+-- DATA VAULT SATELLITE LOAD  —  PROCEDURE VERSION
+-- Compatible with : Greenplum 6 / PostgreSQL 11+
+-- Call syntax     : CALL dds.load_satellite('CRM','sat_customer','2024-03-25');
+-- ============================================================
+
+
+-- ----------------------------------------------------------------
+-- 0. AUDIT LOG TABLE  (create once)
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dds.satellite_load_log (
+    log_id          SERIAL,
+    system_name     VARCHAR(100),
+    table_name      VARCHAR(200),
+    oper_date       DATE,
+    rows_inserted   INT     DEFAULT 0,
+    rows_closed     INT     DEFAULT 0,
+    rows_skipped    INT     DEFAULT 0,
+    status          VARCHAR(20),   -- 'SUCCESS' | 'ERROR'
+    error_message   TEXT,
+    started_at      TIMESTAMP DEFAULT NOW(),
+    finished_at     TIMESTAMP
+) DISTRIBUTED BY (log_id);
+
+
+-- ----------------------------------------------------------------
+-- 1. MAIN PROCEDURE: dds.load_satellite
+-- ----------------------------------------------------------------
+-- Parameters:
+--   p_system_name : source system label  (e.g. 'CRM', 'ERP')
+--   p_table_name  : base name WITHOUT schema / suffix
+--                     ODS source => ods.<p_table_name>_ods
+--                     DDS target => dds.<p_table_name>
+--   p_oper_date   : business/operational date for this load
+-- ----------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE dds.load_satellite(
+    IN p_system_name  VARCHAR,
+    IN p_table_name   VARCHAR,
+    IN p_oper_date    DATE
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    -- resolved table names
+    v_ods_table     TEXT;
+    v_dds_table     TEXT;
+
+    -- dynamic SQL
+    v_sql           TEXT;
+
+    -- column-list strings built from information_schema
+    v_col_list      TEXT := '';   -- plain column list:   col1, col2, ...
+    v_md5_src       TEXT := '';   -- MD5 concat from ODS: COALESCE(src.col1::TEXT,'__NULL__') || ...
+    v_md5_tgt       TEXT := '';   -- MD5 concat from DDS: COALESCE(tgt.col1::TEXT,'__NULL__') || ...
+
+    -- row counters
+    v_inserted      INT  := 0;
+    v_closed        INT  := 0;
+    v_skipped       INT  := 0;
+
+    -- date constants
+    c_min_date      CONSTANT DATE := '1900-01-01';
+    c_max_date      CONSTANT DATE := '9999-12-31';
+
+    -- technical columns excluded from business comparison
+    c_tech_cols     TEXT[] := ARRAY[
+                        'source_id','date_begin','date_end',
+                        'is_actual','load_date','record_source'
+                    ];
+
+    v_col_rec       RECORD;
+    v_started       TIMESTAMP := clock_timestamp();
+BEGIN
+
+    -- --------------------------------------------------------
+    -- Resolve full schema-qualified table names
+    -- --------------------------------------------------------
+    v_ods_table := 'ods.' || p_table_name || '_ods';
+    v_dds_table := 'dds.' || p_table_name;
+
+    RAISE NOTICE '[%] START  system=% | table=% | oper_date=%',
+        clock_timestamp(), p_system_name, p_table_name, p_oper_date;
+
+    -- --------------------------------------------------------
+    -- STEP 1 : Validate both tables exist
+    -- --------------------------------------------------------
+    IF NOT EXISTS (
+        SELECT 1
+        FROM   information_schema.tables
+        WHERE  table_schema = split_part(v_ods_table, '.', 1)
+          AND  table_name   = split_part(v_ods_table, '.', 2)
+    ) THEN
+        RAISE EXCEPTION 'ODS table not found: %', v_ods_table;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM   information_schema.tables
+        WHERE  table_schema = split_part(v_dds_table, '.', 1)
+          AND  table_name   = split_part(v_dds_table, '.', 2)
+    ) THEN
+        RAISE EXCEPTION 'DDS table not found: %', v_dds_table;
+    END IF;
+
+    -- --------------------------------------------------------
+    -- STEP 2 : Discover business columns dynamically
+    --          (all DDS columns except technical ones)
+    -- --------------------------------------------------------
+    FOR v_col_rec IN
+        SELECT column_name
+        FROM   information_schema.columns
+        WHERE  table_schema = split_part(v_dds_table, '.', 1)
+          AND  table_name   = split_part(v_dds_table, '.', 2)
+          AND  column_name  <> ALL(c_tech_cols)
+        ORDER BY ordinal_position
+    LOOP
+        -- append separator after first column
+        IF v_col_list <> '' THEN
+            v_col_list := v_col_list || ', ';
+            v_md5_src  := v_md5_src  || ' || ''|'' || ';
+            v_md5_tgt  := v_md5_tgt  || ' || ''|'' || ';
+        END IF;
+
+        v_col_list := v_col_list || v_col_rec.column_name;
+
+        -- COALESCE turns NULL into a sentinel so hash stays deterministic
+        v_md5_src  := v_md5_src
+                   || 'COALESCE(src.' || v_col_rec.column_name || '::TEXT, ''__NULL__'')';
+        v_md5_tgt  := v_md5_tgt
+                   || 'COALESCE(tgt.' || v_col_rec.column_name || '::TEXT, ''__NULL__'')';
+    END LOOP;
+
+    IF v_col_list = '' THEN
+        RAISE EXCEPTION 'No business columns found in DDS table %', v_dds_table;
+    END IF;
+
+    RAISE NOTICE '[%] Business columns: %', clock_timestamp(), v_col_list;
+
+    -- --------------------------------------------------------
+    -- STEP 3 : Build staging temp table
+    --
+    --   Joins ODS (src) with the currently-active DDS row (tgt)
+    --   and assigns one of three actions:
+    --     'INSERT' — source_id not yet in DDS
+    --     'UPDATE' — source_id exists but MD5 differs  (data changed)
+    --     'SKIP'   — source_id exists and MD5 matches  (no change)
+    -- --------------------------------------------------------
+    DROP TABLE IF EXISTS _sat_stage;
+
+    v_sql :=
+    'CREATE TEMP TABLE _sat_stage AS
+     SELECT
+         src.source_id,
+         ' || v_col_list || ',
+         MD5(' || v_md5_src || ')  AS src_hash,
+         CASE
+             WHEN tgt.source_id IS NULL
+                 THEN ''INSERT''
+             WHEN MD5(' || v_md5_src || ') <> MD5(' || v_md5_tgt || ')
+                 THEN ''UPDATE''
+             ELSE ''SKIP''
+         END AS action
+     FROM ' || v_ods_table || ' src
+     LEFT JOIN ' || v_dds_table || ' tgt
+            ON tgt.source_id = src.source_id
+           AND tgt.is_actual = ''A''';
+
+    EXECUTE v_sql;
+
+    -- Capture counts for logging
+    EXECUTE 'SELECT COUNT(*) FROM _sat_stage WHERE action = ''INSERT''' INTO v_inserted;
+    EXECUTE 'SELECT COUNT(*) FROM _sat_stage WHERE action = ''UPDATE''' INTO v_closed;
+    EXECUTE 'SELECT COUNT(*) FROM _sat_stage WHERE action = ''SKIP'''   INTO v_skipped;
+
+    RAISE NOTICE '[%] Stage result — INSERT: %  |  UPDATE: %  |  SKIP: %',
+        clock_timestamp(), v_inserted, v_closed, v_skipped;
+
+    -- --------------------------------------------------------
+    -- STEP 4 : CLOSE changed records in DDS
+    --          date_end  = oper_date - 1
+    --          is_actual = 'N'
+    -- --------------------------------------------------------
+    v_sql :=
+    'UPDATE ' || v_dds_table || ' tgt
+     SET
+         date_end  = ($1::DATE - INTERVAL ''1 day'')::DATE,
+         is_actual = ''N''
+     FROM _sat_stage stg
+     WHERE stg.action    = ''UPDATE''
+       AND tgt.source_id = stg.source_id
+       AND tgt.is_actual = ''A''';
+
+    EXECUTE v_sql USING p_oper_date;
+    GET DIAGNOSTICS v_closed = ROW_COUNT;
+
+    RAISE NOTICE '[%] Closed % record(s)  (date_end = %)',
+        clock_timestamp(), v_closed, p_oper_date - 1;
+
+    -- --------------------------------------------------------
+    -- STEP 5 : INSERT new rows
+    --
+    --   NEW records    → date_begin = '1900-01-01'  (first-ever load)
+    --   CHANGED records→ date_begin = oper_date     (new version)
+    --   Both           → date_end   = '9999-12-31'
+    --                    is_actual  = 'A'
+    -- --------------------------------------------------------
+    v_sql :=
+    'INSERT INTO ' || v_dds_table || ' (
+         source_id,
+         ' || v_col_list || ',
+         date_begin,
+         date_end,
+         is_actual
+     )
+     SELECT
+         source_id,
+         ' || v_col_list || ',
+         CASE
+             WHEN action = ''INSERT'' THEN DATE ''1900-01-01''
+             ELSE $1::DATE
+         END          AS date_begin,
+         DATE ''9999-12-31''  AS date_end,
+         ''A''                AS is_actual
+     FROM _sat_stage
+     WHERE action IN (''INSERT'', ''UPDATE'')';
+
+    EXECUTE v_sql USING p_oper_date;
+    GET DIAGNOSTICS v_inserted = ROW_COUNT;
+
+    RAISE NOTICE '[%] Inserted % new/updated record(s)',
+        clock_timestamp(), v_inserted;
+
+    -- --------------------------------------------------------
+    -- STEP 6 : Cleanup
+    -- --------------------------------------------------------
+    DROP TABLE IF EXISTS _sat_stage;
+
+    -- --------------------------------------------------------
+    -- STEP 7 : Write audit log row and COMMIT
+    -- --------------------------------------------------------
+    INSERT INTO dds.satellite_load_log
+        (system_name, table_name, oper_date,
+         rows_inserted, rows_closed, rows_skipped,
+         status, started_at, finished_at)
+    VALUES
+        (p_system_name, p_table_name, p_oper_date,
+         v_inserted, v_closed, v_skipped,
+         'SUCCESS', v_started, clock_timestamp());
+
+    -- COMMIT makes this table's changes durable immediately.
+    -- In a batch run the next table starts fresh even if it later fails.
+    COMMIT;
+
+    RAISE NOTICE '[%] COMMITTED  system=% | table=% | inserted=% closed=% skipped=%',
+        clock_timestamp(), p_system_name, p_table_name,
+        v_inserted, v_closed, v_skipped;
+
+-- ----------------------------------------------------------------
+-- ERROR HANDLER
+-- ----------------------------------------------------------------
+EXCEPTION WHEN OTHERS THEN
+
+    DROP TABLE IF EXISTS _sat_stage;
+
+    INSERT INTO dds.satellite_load_log
+        (system_name, table_name, oper_date,
+         status, error_message, started_at, finished_at)
+    VALUES
+        (p_system_name, p_table_name, p_oper_date,
+         'ERROR', SQLERRM, v_started, clock_timestamp());
+
+    COMMIT;   -- commit the error-log row even though the load failed
+
+    RAISE WARNING '[%] FAILED  system=% | table=% | error: %',
+        clock_timestamp(), p_system_name, p_table_name, SQLERRM;
+
+END;
+$$;
+
+
+-- ================================================================
+-- 2. SATELLITE REGISTRY TABLE
+--    Register all 200+ DDS tables here once.
+-- ================================================================
+CREATE TABLE IF NOT EXISTS dds.satellite_registry (
+    id          SERIAL PRIMARY KEY,
+    system_name VARCHAR(100) NOT NULL,
+    table_name  VARCHAR(200) NOT NULL,
+    is_active   CHAR(1)      DEFAULT 'Y',
+    load_order  INT          DEFAULT 100,
+    description TEXT,
+    created_at  TIMESTAMP    DEFAULT NOW()
+);
+
+-- Example registrations:
+-- INSERT INTO dds.satellite_registry (system_name, table_name, load_order) VALUES
+--   ('CRM', 'sat_customer',      10),
+--   ('CRM', 'sat_contact',       20),
+--   ('ERP', 'sat_product',       10),
+--   ('ERP', 'sat_order_details', 20);
+
+
+-- ================================================================
+-- 3. BATCH RUNNER PROCEDURE: dds.run_all_satellites
+--    Loops through the registry and calls load_satellite for each.
+--    Each table is committed independently — a failure in one table
+--    does NOT roll back previously completed tables.
+-- ================================================================
+CREATE OR REPLACE PROCEDURE dds.run_all_satellites(
+    IN p_system_name  VARCHAR,          -- NULL = run every system
+    IN p_oper_date    DATE DEFAULT CURRENT_DATE
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_rec           RECORD;
+    v_total         INT := 0;
+    v_ok            INT := 0;
+    v_fail          INT := 0;
+BEGIN
+    RAISE NOTICE '[%] === BATCH START  system=% | oper_date=% ===',
+        clock_timestamp(),
+        COALESCE(p_system_name, 'ALL'),
+        p_oper_date;
+
+    FOR v_rec IN
+        SELECT system_name, table_name
+        FROM   dds.satellite_registry
+        WHERE  is_active = 'Y'
+          AND  (p_system_name IS NULL OR system_name = p_system_name)
+        ORDER BY load_order, table_name
+    LOOP
+        v_total := v_total + 1;
+        RAISE NOTICE '[%] >>> [%/%] Calling load_satellite for: %',
+            clock_timestamp(), v_total, '?', v_rec.table_name;
+
+        BEGIN
+            -- Each CALL runs the procedure in its own internal commit scope
+            CALL dds.load_satellite(
+                v_rec.system_name,
+                v_rec.table_name,
+                p_oper_date
+            );
+            v_ok := v_ok + 1;
+
+        EXCEPTION WHEN OTHERS THEN
+            -- Warning only — continue with the next table
+            v_fail := v_fail + 1;
+            RAISE WARNING 'Batch: skipping % after error: %',
+                v_rec.table_name, SQLERRM;
+        END;
+    END LOOP;
+
+    RAISE NOTICE '[%] === BATCH END  total=% | success=% | failed=% ===',
+        clock_timestamp(), v_total, v_ok, v_fail;
+
+    COMMIT;
+END;
+$$;
+
+
+-- ================================================================
+-- CALL EXAMPLES
+-- ================================================================
+
+-- Single table:
+CALL dds.load_satellite('CRM', 'sat_customer', '2024-03-25');
+
+-- All tables for one system:
+CALL dds.run_all_satellites('CRM', '2024-03-25');
+
+-- All tables for ALL systems, using today's date:
+CALL dds.run_all_satellites(NULL, CURRENT_DATE);
+
+-- Check execution log:
+SELECT *
+FROM   dds.satellite_load_log
+WHERE  oper_date = CURRENT_DATE
+ORDER  BY started_at DESC;
+
+
+-- ================================================================
+-- EXPECTED TABLE STRUCTURES (reference)
+-- ================================================================
+--
+-- ODS source:  ods.sat_customer_ods
+-- ┌───────────┬──────────┬─────────────┬──────────┐
+-- │ source_id │ name     │ email       │ phone    │
+-- └───────────┴──────────┴─────────────┴──────────┘
+--
+-- DDS target:  dds.sat_customer
+-- ┌───────────┬──────────┬─────────────┬──────────┬────────────┬────────────┬───────────┐
+-- │ source_id │ name     │ email       │ phone    │ date_begin │ date_end   │ is_actual │
+-- ├───────────┼──────────┼─────────────┼──────────┼────────────┼────────────┼───────────┤
+-- │ 101       │ John     │ j@old.com   │ 111-222  │ 1900-01-01 │ 2024-03-24 │ N         │ closed
+-- │ 101       │ John     │ j@new.com   │ 111-222  │ 2024-03-25 │ 9999-12-31 │ A         │ new ver
+-- │ 102       │ Alice    │ a@corp.com  │ 333-444  │ 1900-01-01 │ 9999-12-31 │ A         │ unchanged
+-- └───────────┴──────────┴─────────────┴──────────┴────────────┴────────────┴───────────┘
