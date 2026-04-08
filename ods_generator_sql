@@ -1,0 +1,220 @@
+import os
+import logging
+from airflow import DAG
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+from halykbank.custom.GPDatabaseHelper import GPDatabaseHelper
+from halykbank.custom.OracleToGPTypeMapper import OracleToGPTypeMapper
+
+DAG_ID = "ods_generator_sql_opt"
+logger = logging.getLogger(__name__)
+
+# ---------- Конфиг ----------
+ALL_TAB_COLS_MAP = {
+    "crs": {
+        "pxf_all_table": "etl.crs3bw_all_tab_columns",
+        "pxf_all_constraints": "etl.crs3bw_all_constraints",
+        "pxf_all_con_cols": "etl.crs3bw_all_cons_columns",
+    },
+    "cbs": {
+        "pxf_all_table": "etl.cbs3bw_all_tab_columns",
+        "pxf_all_constraints": "etl.cbs3bw_all_constraints",
+        "pxf_all_con_cols": "etl.cbs3bw_all_cons_columns",
+    },
+    "way4": {
+        "pxf_all_table": "etl.way4_all_tab_columns",
+        "pxf_all_constraints": "etl.way4_all_constraints",
+        "pxf_all_con_cols": "etl.way4_all_cons_columns",
+    },
+}
+
+
+# ---------- Утилиты ----------
+def map_oracle_type(col, for_pxf=False):
+    # """Маппинг типов Oracle -> Greenplum"""
+    if col.data_type == "NUMBER":
+        if col.data_precision and col.data_scale == 0:
+            if col.data_precision < 5:
+                return "int2"
+            elif col.data_precision < 9:
+                return "int8"
+            elif col.data_precision < 19:
+                return "bigint"
+            else:
+                return f"decimal({col.data_precision})"
+        if not col.data_precision and col.column_name.endswith("_ID"):
+            return "int8"
+        return "double precision"
+
+    if col.data_type in ["VARCHAR2", "NVARCHAR2", "NCHAR", "CHARACTER", "CHAR"]:
+        #if for_pxf==True:
+         #   return "bytea" 
+        dtype = col.data_type.lstrip("N").rstrip("2")
+        if col.char_length and col.char_length > 0:
+            return f"{dtype}({col.char_length})"
+        return dtype
+
+    mapping = {
+        "BFILE": "varchar(255)",
+        "BINARY_FLOAT": "real",
+        "BLOB": "bytea",
+        "LONG RAW": "bytea",
+        "CLOB": "text",
+        "NCLOB": "text",
+        "LONG": "text",
+        "ROWID": "char(10)",
+        "XMLTYPE": "text",
+    }
+    if col.data_type in mapping:
+        return mapping[col.data_type]
+
+    if col.data_type == "DATE":
+        return "date" if col.column_name in ["DATE_VALUE", "DOPER"] else "timestamp"
+
+    if "with time zone" in col.data_type.lower():
+        return "timestamp"
+        
+    if col.data_type == "FLOAT":
+        return "double precision"
+
+    return col.data_type
+
+
+def build_table_ddl(table, columns):
+    # """Формируем SQL-скрипт для создания таблицы"""
+    col_defs = [f"{c.column_name} {OracleToGPTypeMapper.map_type(c)}" for c in columns]
+    col_defs_pxf = [f"{c.column_name} {OracleToGPTypeMapper.map_type(c, is_pxf=False)}" for c in columns]
+
+    columns_type_str = ",\n".join(col_defs)
+    columns_type_str_pxf = ",\n".join(col_defs_pxf)
+    columns_str = ",".join([c.column_name for c in columns])
+
+    # Для type3 загрузки
+    extra_column_for_pxf = ""
+    resource_string = f"{table.source_schema}.{table.table_name}"
+    if table.source_columns_with_date:
+        cols_date = [col.strip().lower() for col in table.source_columns_with_date.split(",")]
+        extra_column_for_pxf = ", " + ", ".join(f"{c} date" for c in cols_date)
+        resource_string = f"query:{table.source_schema}_{table.table_name}".lower()
+        with open(
+            os.path.join(
+                "/opt/airflow/dags/sql/ods/named_query",
+                table.sourse_system,
+                f"{table.source_schema}_{table.table_name}.sql".lower(),
+            ),
+            "w",
+        ) as f:
+            f.write(table.named_query_script)
+
+    distrib = f"BY ({table.target_table_distrib_col})" if table.target_table_distrib_col else "REPLICATED"
+    order = f"\nORDER BY ({table.target_table_order_col})" if table.target_table_distrib_col else ''
+
+    if table.source_table_filter is not None:
+        filter_value = f"replace('{table.source_table_filter.replace('\'', '\'\'')}', 'oper_date', (SELECT etl.f_oper_date_get())::text)"
+    else:
+        filter_value = None
+
+    return f"""
+     --DROP FOREIGN TABLE IF EXISTS {table.schema_name}.{table.table_name}_f;
+    CREATE FOREIGN TABLE IF NOT EXISTS {table.schema_name}.{table.table_name}_f(
+        {columns_type_str_pxf}{extra_column_for_pxf}
+    )
+    SERVER {table.source_connect}
+    OPTIONS (
+        newline 'CR',
+        resource '{resource_string}'
+    );
+
+    -- DROP TABLE IF EXISTS {table.schema_name}.{table.table_name};
+    CREATE TABLE IF NOT EXISTS {table.schema_name}.{table.table_name}(
+        {columns_type_str},
+        oper_date DATE,
+        load_date_ts TIMESTAMP
+    )
+    USING mars3 WITH (compresstype=zstd, compresslevel='1', mars3options='prefer_load_mode = single')
+    DISTRIBUTED {distrib} {order}
+    PARTITION BY RANGE (oper_date) (
+        START ('2026-03-01') END ('2026-03-31') EVERY (INTERVAL '1 day')
+    );
+
+    SELECT is_error, error_message
+    FROM etl.f_load_data_ods(
+        '{table.file_name}',
+        '{table.schema_name}',
+        '{columns_str.strip()}',
+        (SELECT etl.f_oper_date_get()),
+        {filter_value if filter_value is not None else 'NULL'}
+    );
+    """
+
+
+def generate_ddl():
+    gp = GPDatabaseHelper(conn_id='ymatrix_prod')
+    tables = gp.select(
+        """
+        select t.id, t.table_type, t.system_name as sourse_system, source_schema, 
+               t.table_name, t.schema_name, target_table_distrib_col, target_table_order_col, 
+               target_table_partition_col, target_table_partition_int,
+               source_connect, source_table_filter, is_gen_sql, 
+               source_columns_with_date, named_query_script, file_name
+        from etl.target_table t
+        where is_alive is true 
+        and is_gen_sql is false
+        and table_type = 'ods'
+        and system_name = 'way4';
+        --and table_name in ('evnt_msg');
+        """
+    )
+
+    for table in tables:
+        logger.info(f"Start processing {table.source_schema}.{table.table_name}")
+
+        if table.table_type != "ods":
+            continue
+
+        cfg = ALL_TAB_COLS_MAP.get(table.sourse_system)
+        if not cfg:
+            raise ValueError(f"No config for source system {table.sourse_system}")
+
+        columns = gp.select(
+            f"""
+            select * 
+            from {cfg["pxf_all_table"]}
+            where owner=upper('{table.source_schema}')
+              and table_name=upper('{table.table_name}')
+            order by column_id
+            """
+        )
+
+        ddl_str = build_table_ddl(table, columns)
+
+        ddl_path = os.path.join("/opt/airflow/dags/sql/ods", table.sourse_system, f"{table.table_name}.sql")
+        os.makedirs(os.path.dirname(ddl_path), exist_ok=True)
+        with open(ddl_path, "w") as f:
+            f.write(ddl_str)
+
+        gp.exec(f"UPDATE etl.target_table SET is_gen_sql=true WHERE id={table.id};")
+        gp.commit()
+
+
+# ---------- DAG ----------
+with DAG(
+    dag_id=DAG_ID,
+    catchup=False,
+    max_active_runs=1,
+    start_date=datetime(2025, 9, 10),
+    schedule_interval=None,
+    tags=["framework", "generator", "aibar"],
+) as dag:
+
+    t_start = EmptyOperator(task_id="t_start")
+    t_end = EmptyOperator(task_id="t_end")
+
+    t_generate_ddl = PythonOperator(
+        task_id="t_generate_ddl",
+        python_callable=generate_ddl,
+    )
+
+    t_start >> t_generate_ddl >> t_end
