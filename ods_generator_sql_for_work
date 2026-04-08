@@ -156,21 +156,19 @@ def build_table_ddl(table, columns, bad_columns_set: set):
         filter_value = None
 
     # ------------------------------------------------------------------ #
-    #  3rd table: _actual                                                 #
-    #  load_type=1 → plain actual table                                  #
-    #  load_type=4 → actual table + date_begin / date_end / is_actual    #
+    #  3rd table DDL — created only when load_type in (1, 4)            #
+    #  load_type=1 → plain actual table (no extra technical columns)    #
+    #  load_type=4 → actual table + date_begin / date_end / is_actual   #
     # ------------------------------------------------------------------ #
-    actual_table_ddl = ""
+    load_type_based_ddl = ""
     load_type = getattr(table, "load_type", None)
 
     if load_type in (1, 4):
-        # Technical columns shared by both load types
         tech_cols_base = (
             "    oper_date      DATE,\n"
             "    load_date_ts   TIMESTAMP"
         )
 
-        # Extra columns only for load_type=4 (SCD-2 / historisation)
         scd2_cols = ""
         if load_type == 4:
             scd2_cols = (
@@ -180,8 +178,8 @@ def build_table_ddl(table, columns, bad_columns_set: set):
                 "    is_actual      BOOLEAN"
             )
 
-        actual_table_ddl = f"""
-    -- 3rd table: actual table (load_type={load_type})
+        load_type_based_ddl = f"""
+    -- 3rd table (load_type={load_type})
     -- DROP TABLE IF EXISTS {table.schema_name}.{table.table_name}_actual;
     CREATE TABLE IF NOT EXISTS {table.schema_name}.{table.table_name}_actual (
         {columns_type_str_actual},
@@ -196,9 +194,14 @@ def build_table_ddl(table, columns, bad_columns_set: set):
 
     # ------------------------------------------------------------------ #
     #  Assemble final DDL                                                 #
+    #  Order: 1) Foreign table  (_f)       — always                     #
+    #         2) Main ODS table            — always                     #
+    #         3) load_type-based table     — only if load_type in (1,4) #
+    #         4) f_load_data_ods call      — always                     #
     # ------------------------------------------------------------------ #
     return f"""
-     --DROP FOREIGN TABLE IF EXISTS {table.schema_name}.{table.table_name}_f;
+    -- 1) FOREIGN TABLE
+    --DROP FOREIGN TABLE IF EXISTS {table.schema_name}.{table.table_name}_f;
     CREATE FOREIGN TABLE IF NOT EXISTS {table.schema_name}.{table.table_name}_f(
         {columns_type_str_pxf}{extra_column_for_pxf}
     )
@@ -208,6 +211,7 @@ def build_table_ddl(table, columns, bad_columns_set: set):
         resource '{resource_string}'
     );
 
+    -- 2) ACTUAL TABLE (main ODS)
     -- DROP TABLE IF EXISTS {table.schema_name}.{table.table_name};
     CREATE TABLE IF NOT EXISTS {table.schema_name}.{table.table_name}(
         {columns_type_str},
@@ -219,7 +223,7 @@ def build_table_ddl(table, columns, bad_columns_set: set):
     PARTITION BY RANGE (oper_date) (
         START ('2026-03-01') END ('2026-03-31') EVERY (INTERVAL '1 day')
     );
-{actual_table_ddl}
+{load_type_based_ddl}
     SELECT is_error, error_message
     FROM etl.f_load_data_ods(
         '{table.file_name}',
