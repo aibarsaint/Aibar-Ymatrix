@@ -8,7 +8,7 @@ from datetime import datetime
 from halykbank.custom.GPDatabaseHelper import GPDatabaseHelper
 from halykbank.custom.OracleToGPTypeMapper import OracleToGPTypeMapper
 
-DAG_ID = "ods_generator_sql_opt"
+DAG_ID = "ods_generator_sql_new_v1"
 logger = logging.getLogger(__name__)
 
 # ---------- Конфиг ----------
@@ -33,7 +33,6 @@ ALL_TAB_COLS_MAP = {
 
 # ---------- Утилиты ----------
 def map_oracle_type(col, for_pxf=False):
-    # """Маппинг типов Oracle -> Greenplum"""
     if col.data_type == "NUMBER":
         if col.data_precision and col.data_scale == 0:
             if col.data_precision < 5:
@@ -49,8 +48,6 @@ def map_oracle_type(col, for_pxf=False):
         return "double precision"
 
     if col.data_type in ["VARCHAR2", "NVARCHAR2", "NCHAR", "CHARACTER", "CHAR"]:
-        #if for_pxf==True:
-         #   return "bytea" 
         dtype = col.data_type.lstrip("N").rstrip("2")
         if col.char_length and col.char_length > 0:
             return f"{dtype}({col.char_length})"
@@ -75,23 +72,56 @@ def map_oracle_type(col, for_pxf=False):
 
     if "with time zone" in col.data_type.lower():
         return "timestamp"
-        
+
     if col.data_type == "FLOAT":
         return "double precision"
 
     return col.data_type
 
 
-def build_table_ddl(table, columns):
-    # """Формируем SQL-скрипт для создания таблицы"""
-    col_defs = [f"{c.column_name} {OracleToGPTypeMapper.map_type(c)}" for c in columns]
-    col_defs_pxf = [f"{c.column_name} {OracleToGPTypeMapper.map_type(c, is_pxf=False)}" for c in columns]
+def build_table_ddl(table, columns, bad_columns_set: set):
+    """
+    Builds DDL for:
+      1. Foreign table  (_f)  — columns in bad_columns_set are forced to BYTEA
+      2. Main ODS table       — uses standard type mapping
+      3. Actual table (_actual):
+           - load_type=1 → plain actual table (no extra technical columns)
+           - load_type=4 → actual table with date_begin, date_end, is_actual columns
+    """
 
-    columns_type_str = ",\n".join(col_defs)
-    columns_type_str_pxf = ",\n".join(col_defs_pxf)
-    columns_str = ",".join([c.column_name for c in columns])
+    # ------------------------------------------------------------------ #
+    #  Helper: resolve column type, overriding with BYTEA when needed     #
+    # ------------------------------------------------------------------ #
+    def resolve_type_foreign(col):
+        """For foreign table: BYTEA if column is flagged in analyzed_bad_columns."""
+        col_key = (table.source_schema.upper(), table.table_name.upper(), col.column_name.upper())
+        if col_key in bad_columns_set:
+            logger.info(
+                f"Column {col.column_name} of table {table.table_name} "
+                f"overridden to BYTEA (found in analyzed_bad_columns)"
+            )
+            return "bytea"
+        return OracleToGPTypeMapper.map_type(col, is_pxf=False)
 
-    # Для type3 загрузки
+    def resolve_type_actual(col):
+        """For actual/ODS tables: standard type mapping (no BYTEA override)."""
+        return OracleToGPTypeMapper.map_type(col)
+
+    # ------------------------------------------------------------------ #
+    #  Build column definition lists                                      #
+    # ------------------------------------------------------------------ #
+    col_defs_foreign = [f"{c.column_name} {resolve_type_foreign(c)}" for c in columns]
+    col_defs_main    = [f"{c.column_name} {resolve_type_actual(c)}"  for c in columns]
+    col_defs_actual  = [f"{c.column_name} {resolve_type_actual(c)}"  for c in columns]
+
+    columns_type_str_pxf    = ",\n".join(col_defs_foreign)
+    columns_type_str        = ",\n".join(col_defs_main)
+    columns_type_str_actual = ",\n".join(col_defs_actual)
+    columns_str             = ",".join([c.column_name for c in columns])
+
+    # ------------------------------------------------------------------ #
+    #  Extra date columns for type3 / named-query mode                   #
+    # ------------------------------------------------------------------ #
     extra_column_for_pxf = ""
     resource_string = f"{table.source_schema}.{table.table_name}"
     if table.source_columns_with_date:
@@ -108,16 +138,70 @@ def build_table_ddl(table, columns):
         ) as f:
             f.write(table.named_query_script)
 
+    # ------------------------------------------------------------------ #
+    #  Distribution / ordering                                            #
+    # ------------------------------------------------------------------ #
     distrib = f"BY ({table.target_table_distrib_col})" if table.target_table_distrib_col else "REPLICATED"
-    order = f"\nORDER BY ({table.target_table_order_col})" if table.target_table_distrib_col else ''
+    order   = f"\nORDER BY ({table.target_table_order_col})" if table.target_table_distrib_col else ""
 
+    # ------------------------------------------------------------------ #
+    #  Optional filter for f_load_data_ods                               #
+    # ------------------------------------------------------------------ #
     if table.source_table_filter is not None:
-        filter_value = f"replace('{table.source_table_filter.replace('\'', '\'\'')}', 'oper_date', (SELECT etl.f_oper_date_get())::text)"
+        filter_value = (
+            f"replace('{table.source_table_filter.replace(chr(39), chr(39)+chr(39))}', "
+            f"'oper_date', (SELECT etl.f_oper_date_get())::text)"
+        )
     else:
         filter_value = None
 
+    # ------------------------------------------------------------------ #
+    #  3rd table DDL — created only when load_type in (1, 4)            #
+    #  load_type=1 → plain actual table (no extra technical columns)    #
+    #  load_type=4 → actual table + date_begin / date_end / is_actual   #
+    # ------------------------------------------------------------------ #
+    load_type_based_ddl = ""
+    load_type = getattr(table, "load_type", None)
+
+    if load_type in (1, 4):
+        tech_cols_base = (
+            "    oper_date      DATE,\n"
+            "    load_date_ts   TIMESTAMP"
+        )
+
+        scd2_cols = ""
+        if load_type == 4:
+            scd2_cols = (
+                ",\n"
+                "    date_begin     DATE,\n"
+                "    date_end       DATE,\n"
+                "    is_actual      BOOLEAN"
+            )
+
+        load_type_based_ddl = f"""
+    -- 3rd table (load_type={load_type})
+    -- DROP TABLE IF EXISTS {table.schema_name}.{table.table_name}_actual;
+    CREATE TABLE IF NOT EXISTS {table.schema_name}.{table.table_name}_actual (
+        {columns_type_str_actual},
+{tech_cols_base}{scd2_cols}
+    )
+    USING mars3 WITH (compresstype=zstd, compresslevel='1', mars3options='prefer_load_mode = single')
+    DISTRIBUTED {distrib} {order}
+    PARTITION BY RANGE (oper_date) (
+        START ('2026-03-01') END ('2026-03-31') EVERY (INTERVAL '1 day')
+    );
+"""
+
+    # ------------------------------------------------------------------ #
+    #  Assemble final DDL                                                 #
+    #  Order: 1) Foreign table  (_f)       — always                     #
+    #         2) Main ODS table            — always                     #
+    #         3) load_type-based table     — only if load_type in (1,4) #
+    #         4) f_load_data_ods call      — always                     #
+    # ------------------------------------------------------------------ #
     return f"""
-     --DROP FOREIGN TABLE IF EXISTS {table.schema_name}.{table.table_name}_f;
+    -- 1) FOREIGN TABLE
+    --DROP FOREIGN TABLE IF EXISTS {table.schema_name}.{table.table_name}_f;
     CREATE FOREIGN TABLE IF NOT EXISTS {table.schema_name}.{table.table_name}_f(
         {columns_type_str_pxf}{extra_column_for_pxf}
     )
@@ -127,6 +211,7 @@ def build_table_ddl(table, columns):
         resource '{resource_string}'
     );
 
+    -- 2) SATEGE TABLE (ODS SGT)
     -- DROP TABLE IF EXISTS {table.schema_name}.{table.table_name};
     CREATE TABLE IF NOT EXISTS {table.schema_name}.{table.table_name}(
         {columns_type_str},
@@ -135,10 +220,8 @@ def build_table_ddl(table, columns):
     )
     USING mars3 WITH (compresstype=zstd, compresslevel='1', mars3options='prefer_load_mode = single')
     DISTRIBUTED {distrib} {order}
-    PARTITION BY RANGE (oper_date) (
-        START ('2026-03-01') END ('2026-03-31') EVERY (INTERVAL '1 day')
     );
-
+{load_type_based_ddl}
     SELECT is_error, error_message
     FROM etl.f_load_data_ods(
         '{table.file_name}',
@@ -152,19 +235,40 @@ def build_table_ddl(table, columns):
 
 def generate_ddl():
     gp = GPDatabaseHelper(conn_id='ymatrix_prod')
+
+    # ------------------------------------------------------------------
+    # Load analyzed_bad_columns ONCE upfront into a set of (table, col)
+    # tuples (both uppercased) for O(1) lookup during DDL generation.
+    # ------------------------------------------------------------------
+    bad_rows = gp.select(
+        """
+        SELECT source_schema, source_table as table_name, column_name
+        FROM tmp.analyzed_bad_columns_opt;
+        """
+    )
+    bad_columns_set = {
+        (row.source_schema.upper(), row.table_name.upper(), row.column_name.upper())
+        for row in bad_rows
+    }
+    logger.info(f"Loaded {len(bad_columns_set)} entries from analyzed_bad_columns")
+
+    # ------------------------------------------------------------------
+    # Main loop — same query as before, now also fetches load_type
+    # ------------------------------------------------------------------
     tables = gp.select(
         """
-        select t.id, t.table_type, t.system_name as sourse_system, source_schema, 
-               t.table_name, t.schema_name, target_table_distrib_col, target_table_order_col, 
+        SELECT t.id, t.table_type, t.system_name AS sourse_system, source_schema,
+               t.table_name, t.schema_name, target_table_distrib_col, target_table_order_col,
                target_table_partition_col, target_table_partition_int,
-               source_connect, source_table_filter, is_gen_sql, 
+               source_connect, source_table_filter, is_gen_sql,
                source_columns_with_date, named_query_script, file_name
-        from etl.target_table t
-        where is_alive is true 
-        and is_gen_sql is false
-        and table_type = 'ods'
-        and system_name = 'way4';
-        --and table_name in ('evnt_msg');
+               --t.load_type                          -- NEW: needed for 3rd-table logic
+        FROM etl.target_table t
+        WHERE is_alive IS TRUE
+          AND is_gen_sql IS FALSE
+          AND table_type = 'ods'
+          AND system_name = 'way4'
+          AND table_name IN ('lang');
         """
     )
 
@@ -180,17 +284,20 @@ def generate_ddl():
 
         columns = gp.select(
             f"""
-            select * 
-            from {cfg["pxf_all_table"]}
-            where owner=upper('{table.source_schema}')
-              and table_name=upper('{table.table_name}')
-            order by column_id
+            SELECT *
+            FROM {cfg["pxf_all_table"]}
+            WHERE owner = upper('{table.source_schema}')
+              AND table_name = upper('{table.table_name}')
+            ORDER BY column_id
             """
         )
 
-        ddl_str = build_table_ddl(table, columns)
+        # Pass bad_columns_set so build_table_ddl can apply BYTEA override
+        ddl_str = build_table_ddl(table, columns, bad_columns_set)
 
-        ddl_path = os.path.join("/opt/airflow/dags/sql/ods", table.sourse_system, f"{table.table_name}.sql")
+        ddl_path = os.path.join(
+            "/opt/airflow/dags/sql/ods", table.sourse_system, f"{table.table_name}.sql"
+        )
         os.makedirs(os.path.dirname(ddl_path), exist_ok=True)
         with open(ddl_path, "w") as f:
             f.write(ddl_str)
